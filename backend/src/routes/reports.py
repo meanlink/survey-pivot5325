@@ -26,13 +26,38 @@ def toggle(id:int,db=Depends(get_db),u=Depends(admin_only)):
     return report_dict(r)
 @router.get('/deliveries')
 def deliveries(db=Depends(get_db),u=Depends(current_user)):
-    return [delivery_dict(d) for d in db.scalars(select(Delivery).order_by(Delivery.id.desc()).limit(100))]
+    rows=[delivery_dict(d,reports.verify(d)) for d in db.scalars(select(Delivery).order_by(Delivery.id.desc()).limit(100))]
+    return rows
+@router.get('/deliveries/{id}')
+def delivery_detail(id:int,db=Depends(get_db),u=Depends(current_user)):
+    d=db.get(Delivery,id)
+    if not d:raise HTTPException(404,'归档不存在')
+    return delivery_dict(d,reports.verify(d))
+@router.post('/deliveries/{id}/repair')
+def repair(id:int,db=Depends(get_db),u=Depends(admin_only)):
+    d=db.get(Delivery,id)
+    if not d:raise HTTPException(404,'归档不存在')
+    ok,message=reports.repair(db,d)
+    record(db,u.email,'delivery.repair',{'id':id,'ok':ok,'message':message})
+    db.commit()
+    return {**delivery_dict(d,reports.verify(d)),'repair_message':message}
 @router.get('/deliveries/{id}/download')
 def download(id:int,format:str='csv',db=Depends(get_db),u=Depends(current_user)):
     d=db.get(Delivery,id)
     if not d:raise HTTPException(404,'归档不存在')
     if format not in ('csv','json'):raise HTTPException(422,'支持 CSV 或 JSON')
-    filename=d.filename+('.json' if format=='json' else '')
-    p=os.path.join(ARTIFACT_DIR,filename)
-    if not os.path.exists(p):raise HTTPException(404,'归档文件不存在，请重新安排分发')
-    return FileResponse(p,filename=filename,media_type='application/json' if format=='json' else 'text/csv; charset=utf-8')
+    view=reports.verify(d)
+    if view['state']=='pending':
+        raise HTTPException(409,'结果包尚未完整写入，后台会恢复同次分发后再下载')
+    if view['state']!='complete':
+        if reports.legacy_archive(d):
+            raise HTTPException(409,'旧归档文件损坏：'+view['message']+'。旧归档没有分发时快照，不能自动修复；请沿用其余完好副本或重新建立分发计划')
+        raise HTTPException(409,'归档文件损坏：'+view['message']+'。请在分发页按当时分析快照修复整包后再下载')
+    if reports.legacy_archive(d):
+        filename=d.filename+('.json' if format=='json' else '')
+        path=os.path.join(ARTIFACT_DIR,filename)
+        media='application/json' if format=='json' else 'text/csv; charset=utf-8'
+        return FileResponse(path,filename=filename,media_type=media)
+    path=os.path.join(reports.package_dir(d),'report.json' if format=='json' else 'report.csv')
+    return FileResponse(path,filename=f'report-{d.report_id}-delivery-{d.id}.{format}',
+        media_type='application/json' if format=='json' else 'text/csv; charset=utf-8')
